@@ -24,6 +24,59 @@ fn db(context: &str, e: postgres::Error) -> String {
     }
 }
 
+/// One candidate for a name somebody typed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Match {
+    pub device_gid: i64,
+    pub channel_num: String,
+    pub label: String,
+    pub kind: String,
+    pub merged_into: Option<String>,
+}
+
+/// Narrow a set of matches to the one a person meant, if there is one.
+///
+/// Two rules, both found by running the real thing against the real house
+/// rather than reasoned out in advance.
+///
+/// **An exact name beats a substring.** `GeoThermal` matched `GeoThermal`,
+/// `GeoThermal Blower` *and* `GeoThermal Aux Heat`, and reporting that as
+/// ambiguous asks somebody to disambiguate a name they typed exactly.
+///
+/// **A merged circuit beats its own legs.** `Water Heater` matched legs 7 and 8
+/// and merged channel 99 — which is not ambiguity, it is one circuit described
+/// twice. Nobody asking about the water heater means one leg of it. Genuine
+/// ambiguity, two circuits of the same name on different monitors, survives
+/// both rules and is still returned as a question.
+pub fn narrow(matches: &[Match], query: &str) -> Vec<Match> {
+    let exact: Vec<Match> = matches
+        .iter()
+        .filter(|m| m.label.eq_ignore_ascii_case(query.trim()))
+        .cloned()
+        .collect();
+    let pool = if exact.is_empty() {
+        matches.to_vec()
+    } else {
+        exact
+    };
+
+    // Only collapse legs into a merge when every branch in the pool is part of
+    // *some* merge and they all sit on the same monitor as the single merged
+    // candidate. Two unmerged circuits sharing a name must stay ambiguous.
+    let merged: Vec<&Match> = pool.iter().filter(|m| m.kind == "merged").collect();
+    if merged.len() == 1 {
+        let gid = merged[0].device_gid;
+        let legs_of_it = pool
+            .iter()
+            .filter(|m| m.kind != "merged")
+            .all(|m| m.kind == "branch" && m.merged_into.is_some() && m.device_gid == gid);
+        if legs_of_it {
+            return vec![merged[0].clone()];
+        }
+    }
+    pool
+}
+
 /// A label for a channel, in the words a person would use.
 ///
 /// The name a circuit was given, falling back to the monitor and channel number
@@ -226,10 +279,10 @@ fn series(
     // Resolve the circuit first, and say so when it is ambiguous rather than
     // picking one. The same posture as Planner's `ambiguous`: two circuits here
     // are genuinely named the same thing on different monitors.
-    let found = c
+    let rows = c
         .query(
             &format!(
-                "SELECT c.device_gid, c.channel_num, {LABEL} AS label
+                "SELECT c.device_gid, c.channel_num, {LABEL} AS label, c.kind, c.merged_into
                  FROM channel c
                  WHERE ({LABEL}) ILIKE $1
                     OR c.device_gid || '/' || c.channel_num = $2
@@ -238,6 +291,19 @@ fn series(
             &[&format!("%{query}%"), &query],
         )
         .map_err(|e| db("cannot look up a circuit", e))?;
+    let found = narrow(
+        &rows
+            .iter()
+            .map(|r| Match {
+                device_gid: r.get(0),
+                channel_num: r.get(1),
+                label: r.get(2),
+                kind: r.get(3),
+                merged_into: r.get(4),
+            })
+            .collect::<Vec<_>>(),
+        query,
+    );
 
     if found.is_empty() {
         return Ok(json!({
@@ -248,10 +314,10 @@ fn series(
     if found.len() > 1 {
         let candidates: Vec<Value> = found
             .iter()
-            .map(|r| {
+            .map(|m| {
                 json!({
-                    "circuit": r.get::<_, String>(2),
-                    "channel": format!("{}/{}", r.get::<_, i64>(0), r.get::<_, String>(1)),
+                    "circuit": m.label,
+                    "channel": format!("{}/{}", m.device_gid, m.channel_num),
                 })
             })
             .collect();
@@ -262,9 +328,9 @@ fn series(
         }));
     }
 
-    let gid: i64 = found[0].get(0);
-    let num: String = found[0].get(1);
-    let label: String = found[0].get(2);
+    let gid = found[0].device_gid;
+    let num = found[0].channel_num.clone();
+    let label = found[0].label.clone();
 
     let rows = c
         .query(
@@ -371,6 +437,75 @@ mod tests {
         // The trap: branch legs that *are* part of a merge must be excluded, or
         // every 240 V appliance is counted twice.
         assert!(!sql.contains("c.kind = 'branch')"), "{sql}");
+    }
+
+    fn m(gid: i64, num: &str, label: &str, kind: &str, merged: Option<&str>) -> Match {
+        Match {
+            device_gid: gid,
+            channel_num: num.into(),
+            label: label.into(),
+            kind: kind.into(),
+            merged_into: merged.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_merged_circuit_beats_its_own_legs() {
+        // The real case: "Water Heater" matched legs 7 and 8 and merged 99.
+        // That is one circuit described twice, not a question for the user.
+        let matches = vec![
+            m(415375, "7", "Water Heater", "branch", Some("Merged_99")),
+            m(415375, "8", "Water Heater", "branch", Some("Merged_99")),
+            m(415375, "99", "Water Heater", "merged", None),
+        ];
+        let narrowed = narrow(&matches, "Water Heater");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].channel_num, "99");
+    }
+
+    #[test]
+    fn an_exact_name_beats_a_substring() {
+        // "GeoThermal" also matched "GeoThermal Blower" and "GeoThermal Aux
+        // Heat". Asking somebody to disambiguate a name they typed exactly is
+        // the wrong kind of careful.
+        let matches = vec![
+            m(415375, "97", "GeoThermal", "merged", None),
+            m(415375, "100", "GeoThermal Blower", "merged", None),
+            m(415375, "104", "GeoThermal Aux Heat", "merged", None),
+        ];
+        let narrowed = narrow(&matches, "GeoThermal");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].label, "GeoThermal");
+    }
+
+    #[test]
+    fn two_real_circuits_of_the_same_name_stay_a_question() {
+        // The same name on two different monitors is genuine ambiguity and
+        // must survive both rules — guessing here is a wrong answer about the
+        // wrong half of the house.
+        let matches = vec![
+            m(415375, "97", "GeoThermal", "merged", None),
+            m(422778, "97", "GeoThermal", "merged", None),
+        ];
+        assert_eq!(narrow(&matches, "GeoThermal").len(), 2);
+    }
+
+    #[test]
+    fn an_unmerged_leg_sharing_a_name_with_a_merge_stays_a_question() {
+        // A branch that belongs to no merge is its own circuit, so collapsing
+        // it into a similarly-named merge would silently answer about
+        // something else.
+        let matches = vec![
+            m(415375, "99", "Water Heater", "merged", None),
+            m(422818, "4", "Water Heater", "branch", None),
+        ];
+        assert_eq!(narrow(&matches, "Water Heater").len(), 2);
+    }
+
+    #[test]
+    fn a_substring_match_is_still_offered_when_nothing_matches_exactly() {
+        let matches = vec![m(415375, "100", "GeoThermal Blower", "merged", None)];
+        assert_eq!(narrow(&matches, "blower").len(), 1);
     }
 
     #[test]
