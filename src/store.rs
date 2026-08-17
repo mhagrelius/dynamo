@@ -61,6 +61,19 @@ pub fn migrate(c: &mut Client) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS reading_series_instant
             ON reading (device_gid, channel_num, scale, instant DESC);
 
+        -- How far back each series has been *asked* for, which is not the
+        -- same as how far back it holds data. Past the vendor's retention edge
+        -- a window answers 200 with nulls, so nothing is written and the
+        -- oldest row never moves; without this the same empty span is fetched
+        -- on every pass forever.
+        CREATE TABLE IF NOT EXISTS probe (
+            device_gid    BIGINT NOT NULL,
+            channel_num   TEXT   NOT NULL,
+            scale         TEXT   NOT NULL,
+            asked_back_to TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (device_gid, channel_num, scale)
+        );
+
         -- One row, and the only thing `--health` reads. `ok` is false when the
         -- refresh token has been rejected, which is the failure no retry fixes.
         CREATE TABLE IF NOT EXISTS heartbeat (
@@ -164,8 +177,23 @@ pub fn save_readings(
 pub fn watermarks(c: &mut Client) -> Result<HashMap<Series, Watermark>, String> {
     let rows = c
         .query(
-            "SELECT device_gid, channel_num, scale, MAX(instant), MIN(instant)
-             FROM reading GROUP BY device_gid, channel_num, scale",
+            "SELECT r.device_gid, r.channel_num, r.scale,
+                    MAX(r.instant), MIN(r.instant), MIN(p.asked_back_to)
+             FROM reading r
+             LEFT JOIN probe p
+               ON p.device_gid = r.device_gid AND p.channel_num = r.channel_num
+              AND p.scale = r.scale
+             GROUP BY r.device_gid, r.channel_num, r.scale
+             UNION ALL
+             -- A series probed but holding nothing at all: without this arm it
+             -- looks untouched and the empty span is walked again.
+             SELECT p.device_gid, p.channel_num, p.scale,
+                    NULL, NULL, p.asked_back_to
+             FROM probe p
+             WHERE NOT EXISTS (SELECT 1 FROM reading r
+                               WHERE r.device_gid = p.device_gid
+                                 AND r.channel_num = p.channel_num
+                                 AND r.scale = p.scale)",
             &[],
         )
         .map_err(|e| format!("cannot read watermarks: {e}"))?;
@@ -188,10 +216,50 @@ pub fn watermarks(c: &mut Client) -> Result<HashMap<Series, Watermark>, String> 
             Watermark {
                 newest: row.get::<_, Option<DateTime<Utc>>>(3),
                 oldest: row.get::<_, Option<DateTime<Utc>>>(4),
+                asked_back_to: row.get::<_, Option<DateTime<Utc>>>(5),
             },
         );
     }
     Ok(out)
+}
+
+/// Remember how far back each series was taken this pass.
+///
+/// Written once at the end rather than per request: a first pass makes
+/// thousands of fetches and each would otherwise be a round trip to say
+/// something only the last one needs to be true about.
+pub fn record_probes(
+    c: &mut Client,
+    probes: &HashMap<Series, DateTime<Utc>>,
+) -> Result<(), String> {
+    if probes.is_empty() {
+        return Ok(());
+    }
+    let mut tx = c
+        .transaction()
+        .map_err(|e| format!("cannot open transaction: {e}"))?;
+    let stmt = tx
+        .prepare(
+            "INSERT INTO probe (device_gid, channel_num, scale, asked_back_to)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (device_gid, channel_num, scale)
+             DO UPDATE SET asked_back_to = LEAST(probe.asked_back_to, EXCLUDED.asked_back_to)",
+        )
+        .map_err(|e| format!("cannot prepare probe insert: {e}"))?;
+    for (series, earliest) in probes {
+        tx.execute(
+            &stmt,
+            &[
+                &series.device_gid,
+                &series.channel_num,
+                &series.scale.api_name(),
+                earliest,
+            ],
+        )
+        .map_err(|e| format!("cannot record a probe: {e}"))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("cannot commit probes: {e}"))
 }
 
 pub fn record_success(

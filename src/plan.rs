@@ -47,6 +47,16 @@ pub struct Fetch {
 pub struct Watermark {
     pub newest: Option<DateTime<Utc>>,
     pub oldest: Option<DateTime<Utc>>,
+    /// The earliest instant ever *asked* for, which is not the same as the
+    /// earliest held.
+    ///
+    /// **This is the difference between converging and not.** Past the vendor's
+    /// retention edge a window answers 200 with a list of nulls, so nothing is
+    /// written and `oldest` does not move — and a planner that decides what to
+    /// fetch from `oldest` alone asks for that same empty span on every pass,
+    /// forever. Sixteen hundred requests a pass here, which starved the live
+    /// poll until it only ran once per pass.
+    pub asked_back_to: Option<DateTime<Utc>>,
 }
 
 /// A channel as the device list describes it.
@@ -124,7 +134,17 @@ pub fn plan(
             // vendor turns out to serve more than was assumed. On the ordinary
             // pass `oldest` is already at or before the floor and this
             // contributes nothing.
-            if let Some(oldest) = mark.oldest {
+            // How far back this series has been taken, whether or not there
+            // was anything there. Either bound alone is wrong: `oldest` misses
+            // the empty span, and `asked_back_to` alone would re-fetch a gap
+            // that a later pass filled in behind it.
+            let reached = match (mark.oldest, mark.asked_back_to) {
+                (Some(o), Some(a)) => Some(o.min(a)),
+                (Some(o), None) => Some(o),
+                (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            if let Some(oldest) = reached {
                 // **Strictly earlier than the oldest row, not earlier than the
                 // overlap.** Guarding on `f < oldest + step` instead looks
                 // equivalent and is not: when the oldest row sits exactly on
@@ -229,6 +249,7 @@ mod tests {
         Watermark {
             newest: None,
             oldest: None,
+            asked_back_to: None,
         }
     }
 
@@ -302,6 +323,7 @@ mod tests {
             } else {
                 None
             },
+            asked_back_to: None,
         };
         let p = plan(&one_channel(), &marks, &h);
         let first = p.iter().find(|f| f.series.scale == Scale::Minute).unwrap();
@@ -325,6 +347,7 @@ mod tests {
             } else {
                 None
             },
+            asked_back_to: None,
         };
         let p = plan(&one_channel(), &marks, &h);
         let minutes: Vec<_> = p
@@ -343,6 +366,7 @@ mod tests {
         let marks = |_: &Series| Watermark {
             newest: Some(h.now),
             oldest: Some(h.account_created),
+            asked_back_to: None,
         };
         let p = plan(&one_channel(), &marks, &h);
         // The overlap still pulls the start one step back, so a single chunk
@@ -365,11 +389,13 @@ mod tests {
                 Watermark {
                     newest: Some(h.now - Duration::minutes(15)),
                     oldest: Some(held_from),
+                    asked_back_to: None,
                 }
             } else {
                 Watermark {
                     newest: None,
                     oldest: None,
+                    asked_back_to: None,
                 }
             }
         };
@@ -389,6 +415,73 @@ mod tests {
     }
 
     #[test]
+    fn a_span_the_vendor_has_nothing_for_is_asked_once_and_then_left_alone() {
+        // The bug this exists for, and it is the expensive kind: past the
+        // retention edge a window answers 200 with a list of nulls, so nothing
+        // is written and `oldest` never moves. Planning from `oldest` alone
+        // therefore re-fetches the same empty span on every pass, for ever —
+        // sixteen hundred requests a pass here, which starved the live poll
+        // until minute data only updated once per pass.
+        let h = horizon();
+        let held_from = h.now - Duration::days(360);
+        let marks = |s: &Series| {
+            if s.scale == Scale::QuarterHour {
+                Watermark {
+                    newest: Some(h.now - Duration::minutes(15)),
+                    // Nothing older than 360 days exists, but the floor is the
+                    // account's start — so a previous pass already walked the
+                    // empty span and found nothing.
+                    oldest: Some(held_from),
+                    asked_back_to: Some(h.account_created),
+                }
+            } else {
+                Watermark::default()
+            }
+        };
+        let p = plan(&one_channel(), &marks, &h);
+        let behind: Vec<_> = p
+            .iter()
+            .filter(|f| f.series.scale == Scale::QuarterHour && f.start < held_from)
+            .collect();
+        assert!(
+            behind.is_empty(),
+            "re-walked {} empty windows it has already asked for",
+            behind.len()
+        );
+    }
+
+    #[test]
+    fn a_floor_that_moves_back_past_what_was_asked_is_still_fetched() {
+        // The other direction: `asked_back_to` must not wedge a series shut.
+        // If the floor widens beyond anything previously asked for, that span
+        // is new and has to be taken.
+        let h = horizon();
+        let marks = |s: &Series| {
+            if s.scale == Scale::QuarterHour {
+                Watermark {
+                    newest: Some(h.now - Duration::minutes(15)),
+                    oldest: Some(h.now - Duration::days(200)),
+                    asked_back_to: Some(h.now - Duration::days(200)),
+                }
+            } else {
+                Watermark::default()
+            }
+        };
+        let p = plan(&one_channel(), &marks, &h);
+        let behind: Vec<_> = p
+            .iter()
+            .filter(|f| {
+                f.series.scale == Scale::QuarterHour && f.start < h.now - Duration::days(200)
+            })
+            .collect();
+        assert!(
+            !behind.is_empty(),
+            "the newly reachable span was not planned"
+        );
+        assert_eq!(behind.first().unwrap().start, h.account_created);
+    }
+
+    #[test]
     fn nothing_is_planned_behind_when_the_oldest_row_is_already_at_the_floor() {
         // The ordinary pass. Every series has been collected to the floor
         // already, so the backward half must contribute nothing at all —
@@ -397,6 +490,7 @@ mod tests {
         let marks = |_: &Series| Watermark {
             newest: Some(h.now - Duration::minutes(1)),
             oldest: Some(h.account_created),
+            asked_back_to: None,
         };
         let p = plan(&one_channel(), &marks, &h);
         for f in &p {

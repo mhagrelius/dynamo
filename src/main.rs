@@ -244,6 +244,10 @@ fn pass(api: &mut Client, db: &mut postgres::Client, cfg: &Config) -> Result<usi
 
     let mut pace = Pace::per_second(cfg.rate);
     let mut written = 0usize;
+    // How far back each series got taken this pass, recorded whether or not
+    // anything came back. Accumulated here and written once at the end.
+    let mut probed: std::collections::HashMap<plan::Series, DateTime<Utc>> =
+        std::collections::HashMap::new();
     for fetch in &work {
         pace.wait();
         let url = emporia::chart_url(fetch);
@@ -276,10 +280,19 @@ fn pass(api: &mut Client, db: &mut postgres::Client, cfg: &Config) -> Result<usi
             }
         };
         let readings = emporia::readings(&usage, fetch.series.scale);
+        // Recorded on a successful *request*, not a successful row. An empty
+        // window is exactly the case this exists for.
+        probed
+            .entry(fetch.series.clone())
+            .and_modify(|earliest| *earliest = (*earliest).min(fetch.start))
+            .or_insert(fetch.start);
         match store::save_readings(db, &fetch.series, &readings) {
             Ok(n) => written += n,
             Err(e) => eprintln!("dynamo: {e}"),
         }
+    }
+    if let Err(e) = store::record_probes(db, &probed) {
+        eprintln!("dynamo: {e}");
     }
     Ok(written)
 }
