@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use dynamo::config::Config;
 use dynamo::emporia::{self, Account};
 use dynamo::http::{Client, Fault, Pace};
-use dynamo::plan::{self, Horizon, Watermark};
+use dynamo::plan::{self, Horizon};
 use dynamo::store;
 
 fn main() -> ExitCode {
@@ -173,7 +173,7 @@ fn pass(api: &mut Client, db: &mut postgres::Client, cfg: &Config) -> Result<usi
     let plan_channels: Vec<_> = channels.iter().map(|c| c.as_plan_channel()).collect();
     let work = plan::plan(
         &plan_channels,
-        &|s| marks.get(s).cloned().unwrap_or(Watermark { newest: None }),
+        &|s| marks.get(s).cloned().unwrap_or_default(),
         &horizon,
     );
 

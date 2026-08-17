@@ -91,7 +91,7 @@ documentation. The per-request ceilings are quoted verbatim from the API's own
 | --- | --- | --- |
 | `1S` | `PT1H6M40S` (4000 s) | ~7 days |
 | `1MIN` | `PT13H20M` (800 min) | ~7 days |
-| `15MIN` | `PT168H` (7 days) | ~12 months |
+| `15MIN` | `PT168H` (7 days) | ~12 months (edge measured between 365 and 400 days) |
 | `1H` | `PT800H` (~33 days) | to account creation, 2025-01-29 |
 | `1D` | `PT12000H` (500 days) | all of it |
 
@@ -144,12 +144,27 @@ because it is the only call that takes a time range.
 ## Backfill and catch-up are one mechanism
 
 There is no separate "first run" path. For each `(device, channel, scale)` the
-store knows the newest instant it holds; the planner asks for everything between
-that and now, chunked to the scale's ceiling. On an empty database the watermark
-is absent and the start becomes the earliest the scale serves, which is the
-one-time historical load. After a four-minute restart it is four minutes. After
-a fortnight down it is a fortnight of hours, because minutes that old no longer
-exist to be fetched.
+store knows the oldest and newest instants it holds; the planner asks for
+everything between the newest and now, chunked to the scale's ceiling. On an
+empty database both are absent and the start becomes the earliest the scale
+serves, which is the one-time historical load. After a four-minute restart it is
+four minutes. After a fortnight down it is a fortnight of hours, because minutes
+that old no longer exist to be fetched.
+
+**The oldest instant is tracked too, and it is what makes a floor mean anything
+after the first run.** Walking forward from the newest row is enough until a
+floor moves further back — because a guessed number is replaced, or because the
+vendor turns out to serve more than was assumed. At that point a forward-only
+planner does nothing at all: the newly-reachable span sits permanently unfetched
+and the only remedy is deleting rows and starting again. So the planner also
+fills in behind the oldest row.
+
+The guard on that is `floor < oldest`, **strictly**. Folding the one-step
+overlap into the comparison instead looks equivalent and is not: a series whose
+oldest row sits exactly on its floor — which is the steady state for every
+series on every pass — would satisfy it forever and re-fetch one window per
+series per pass, some two hundred pointless requests a minute. A test found
+that, not a rate limit.
 
 The planner is a pure function — watermarks and a clock in, a list of requests
 out — so the awkward cases have tests rather than a note saying they were

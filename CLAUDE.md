@@ -118,6 +118,16 @@ there is no documentation for this API and none of it is guessed.
   a separate "initial import" would create a path that runs once and is never
   exercised again.
 
+- **The watermark carries both ends, and the backward guard is strict.**
+  `Watermark::oldest` is what makes a widened floor mean anything: walk forward
+  from `newest` only, and a floor that moves further back changes nothing for
+  any series already collected — the span stays unfetched and the only remedy
+  is deleting rows. The guard is `floor < oldest`, **not** `floor < oldest +
+  step`. Folding the overlap into the comparison looks equivalent and is the
+  steady state for every series, so it re-fetches one window per series per
+  pass forever. That was caught by a test; it would not have been obvious in a
+  log.
+
 - **The planner overlaps by one point on resume, on purpose.** The upsert makes
   a repeat free, an off-by-one the other way is a permanent hole nothing goes
   back for, and the cloud revises the most recent interval as late readings

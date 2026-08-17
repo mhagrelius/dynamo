@@ -36,9 +36,17 @@ pub struct Fetch {
 }
 
 /// What the store already holds for one channel, per scale.
+///
+/// Both ends, not just the newest. The newest says where to carry on from; the
+/// oldest is what makes a *widened* floor mean anything. Without it, moving a
+/// retention floor further back changes nothing at all for a series that has
+/// already been collected once — the planner walks forward from the newest
+/// instant and never looks behind itself, so the newly-reachable span stays
+/// permanently unfetched and the only remedy is deleting rows.
 #[derive(Clone, Debug, Default)]
 pub struct Watermark {
     pub newest: Option<DateTime<Utc>>,
+    pub oldest: Option<DateTime<Utc>>,
 }
 
 /// A channel as the device list describes it.
@@ -106,10 +114,38 @@ pub fn plan(
                 channel_num: channel.channel_num.clone(),
                 scale,
             };
-            let start = match watermarks(&series).newest {
+            let mark = watermarks(&series);
+            let f = floor(scale, h);
+
+            // Behind what is already held.
+            //
+            // Only does anything when the floor reaches further back than the
+            // oldest row — which happens when a floor is widened, or when the
+            // vendor turns out to serve more than was assumed. On the ordinary
+            // pass `oldest` is already at or before the floor and this
+            // contributes nothing.
+            if let Some(oldest) = mark.oldest {
+                // **Strictly earlier than the oldest row, not earlier than the
+                // overlap.** Guarding on `f < oldest + step` instead looks
+                // equivalent and is not: when the oldest row sits exactly on
+                // the floor — the steady state for every series, on every pass
+                // — it is still true, and one window gets re-fetched for every
+                // series every minute forever. Two hundred-odd pointless
+                // requests a pass, discovered by a test rather than by a
+                // rate limit.
+                if f < oldest {
+                    // The end carries the one step of overlap, for the same
+                    // reason the forward side does: the upsert makes a repeat
+                    // free and a gap of one point would never be revisited.
+                    let back_to = (oldest + scale.step()).min(h.now);
+                    out.extend(chunks(series.clone(), f, back_to, scale));
+                }
+            }
+
+            // Forward from what is already held.
+            let start = match mark.newest {
                 Some(newest) => {
                     let resumed = resume_from(newest, scale);
-                    let f = floor(scale, h);
                     // A watermark older than the retention floor is a gap the
                     // vendor can no longer fill — a fortnight down means the
                     // minutes are gone. Start at the floor and take what is
@@ -121,7 +157,7 @@ pub fn plan(
                         resumed
                     }
                 }
-                None => floor(scale, h),
+                None => f,
             };
             if start >= h.now {
                 continue;
@@ -190,7 +226,10 @@ mod tests {
     }
 
     fn empty(_: &Series) -> Watermark {
-        Watermark { newest: None }
+        Watermark {
+            newest: None,
+            oldest: None,
+        }
     }
 
     #[test]
@@ -257,6 +296,12 @@ mod tests {
             } else {
                 None
             },
+            // Already at the floor, so nothing is planned behind it.
+            oldest: if s.scale == Scale::Minute {
+                Some(h.now - Duration::days(6))
+            } else {
+                None
+            },
         };
         let p = plan(&one_channel(), &marks, &h);
         let first = p.iter().find(|f| f.series.scale == Scale::Minute).unwrap();
@@ -275,10 +320,21 @@ mod tests {
             } else {
                 None
             },
+            oldest: if s.scale == Scale::Minute {
+                Some(stale - Duration::days(1))
+            } else {
+                None
+            },
         };
         let p = plan(&one_channel(), &marks, &h);
-        let first = p.iter().find(|f| f.series.scale == Scale::Minute).unwrap();
-        assert_eq!(first.start, h.now - Duration::days(6));
+        let minutes: Vec<_> = p
+            .iter()
+            .filter(|f| f.series.scale == Scale::Minute)
+            .collect();
+        // Nothing behind: the oldest row already predates the floor, and the
+        // span between them is gone from the vendor for good.
+        assert!(minutes.iter().all(|f| f.start >= h.now - Duration::days(6)));
+        assert_eq!(minutes.first().unwrap().start, h.now - Duration::days(6));
     }
 
     #[test]
@@ -286,6 +342,7 @@ mod tests {
         let h = horizon();
         let marks = |_: &Series| Watermark {
             newest: Some(h.now),
+            oldest: Some(h.account_created),
         };
         let p = plan(&one_channel(), &marks, &h);
         // The overlap still pulls the start one step back, so a single chunk
@@ -293,6 +350,62 @@ mod tests {
         // unbounded list or a chunk running past `now`.
         assert!(p.iter().all(|f| f.end <= h.now));
         assert!(p.len() <= SCALES.len());
+    }
+
+    #[test]
+    fn a_floor_that_moves_further_back_is_filled_in_behind_what_is_already_held() {
+        // The case this exists for. Quarter-hour data was collected under a
+        // 360-day floor; the floor is now the account's own start. Walking
+        // forward from the newest row would never touch the newly-reachable
+        // span, and the only other remedy would be deleting 1.7 million rows.
+        let h = horizon();
+        let held_from = h.now - Duration::days(360);
+        let marks = |s: &Series| {
+            if s.scale == Scale::QuarterHour {
+                Watermark {
+                    newest: Some(h.now - Duration::minutes(15)),
+                    oldest: Some(held_from),
+                }
+            } else {
+                Watermark {
+                    newest: None,
+                    oldest: None,
+                }
+            }
+        };
+        let p = plan(&one_channel(), &marks, &h);
+        let behind: Vec<_> = p
+            .iter()
+            .filter(|f| f.series.scale == Scale::QuarterHour && f.start < held_from)
+            .collect();
+        assert!(
+            !behind.is_empty(),
+            "nothing was planned behind the oldest row"
+        );
+        assert_eq!(behind.first().unwrap().start, h.account_created);
+        // and it stops where the held data begins, plus the overlap
+        let furthest = behind.iter().map(|f| f.end).max().unwrap();
+        assert!(furthest <= held_from + Duration::minutes(15));
+    }
+
+    #[test]
+    fn nothing_is_planned_behind_when_the_oldest_row_is_already_at_the_floor() {
+        // The ordinary pass. Every series has been collected to the floor
+        // already, so the backward half must contribute nothing at all —
+        // otherwise every pass re-fetches the whole history forever.
+        let h = horizon();
+        let marks = |_: &Series| Watermark {
+            newest: Some(h.now - Duration::minutes(1)),
+            oldest: Some(h.account_created),
+        };
+        let p = plan(&one_channel(), &marks, &h);
+        for f in &p {
+            assert!(
+                f.end > h.now - Duration::days(1),
+                "{:?} re-fetched history on an ordinary pass",
+                f
+            );
+        }
     }
 
     #[test]

@@ -84,23 +84,29 @@ impl Scale {
     pub fn retained(self) -> Option<Duration> {
         match self {
             Scale::Minute => Some(Duration::days(6)),
-            // Non-null at 365 days, null at 400; the true edge is somewhere
-            // between and it rolls forward daily, so this is deliberately a
-            // little inside it.
+            // **No floor, deliberately, even though a retention edge exists.**
             //
-            // **Nothing stops early when a window comes back empty** — an
-            // earlier version of this comment claimed otherwise. A window past
-            // the edge is a 200 with a list of nulls, `readings` yields
-            // nothing, and the planner moves on having spent a request. That
-            // is the cost of setting this too generously, and it is why the
-            // number is under the measurement rather than over it.
+            // Quarter-hour data was non-null at 365 days and null at 400, so
+            // the edge is somewhere between and it rolls forward daily. An
+            // earlier version of this pinned 360 days to stay inside it. The
+            // trouble with any fixed number is that it is a guess that gets
+            // stale in the wrong direction: the edge moves, and a floor set
+            // under it silently stops asking for data that is still there.
             //
-            // What it costs the other way: up to about five weeks of the
-            // oldest quarter-hour data is never asked for. That span is still
-            // covered hourly, back to the account's own start, so the loss is
-            // resolution on the oldest part of the record rather than a hole
-            // in it.
-            Scale::QuarterHour => Some(Duration::days(360)),
+            // Asking too far back is not an error and does not corrupt
+            // anything — a window past the edge is a 200 with a list of nulls,
+            // `readings` yields nothing, and nothing is written. **Nothing
+            // stops early on an empty window**, so the cost is real but
+            // bounded: the empty span is walked once, on the first pass for a
+            // series, and never again, because from then on the store holds an
+            // oldest instant and `plan` fills behind that rather than from
+            // here.
+            //
+            // So this is the honest reading of "as far back as it goes": go to
+            // the account's own start and let the vendor's silence be the
+            // answer, rather than encoding a number that was true in August
+            // 2026.
+            Scale::QuarterHour => None,
             Scale::Hour => None,
             Scale::Day => None,
         }

@@ -157,7 +157,7 @@ pub fn save_readings(
 pub fn watermarks(c: &mut Client) -> Result<HashMap<Series, Watermark>, String> {
     let rows = c
         .query(
-            "SELECT device_gid, channel_num, scale, MAX(instant)
+            "SELECT device_gid, channel_num, scale, MAX(instant), MIN(instant)
              FROM reading GROUP BY device_gid, channel_num, scale",
             &[],
         )
@@ -180,6 +180,7 @@ pub fn watermarks(c: &mut Client) -> Result<HashMap<Series, Watermark>, String> 
             },
             Watermark {
                 newest: row.get::<_, Option<DateTime<Utc>>>(3),
+                oldest: row.get::<_, Option<DateTime<Utc>>>(4),
             },
         );
     }
