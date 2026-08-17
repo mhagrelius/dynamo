@@ -84,10 +84,22 @@ impl Scale {
     pub fn retained(self) -> Option<Duration> {
         match self {
             Scale::Minute => Some(Duration::days(6)),
-            // Non-null at 365 days, null at 400. Where exactly it starts is the
-            // backfill's business to discover, not this table's to guess: a
-            // year is the conservative floor and `plan` stops early when a
-            // window comes back empty.
+            // Non-null at 365 days, null at 400; the true edge is somewhere
+            // between and it rolls forward daily, so this is deliberately a
+            // little inside it.
+            //
+            // **Nothing stops early when a window comes back empty** — an
+            // earlier version of this comment claimed otherwise. A window past
+            // the edge is a 200 with a list of nulls, `readings` yields
+            // nothing, and the planner moves on having spent a request. That
+            // is the cost of setting this too generously, and it is why the
+            // number is under the measurement rather than over it.
+            //
+            // What it costs the other way: up to about five weeks of the
+            // oldest quarter-hour data is never asked for. That span is still
+            // covered hourly, back to the account's own start, so the loss is
+            // resolution on the oldest part of the record rather than a hole
+            // in it.
             Scale::QuarterHour => Some(Duration::days(360)),
             Scale::Hour => None,
             Scale::Day => None,
