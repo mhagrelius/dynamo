@@ -1,0 +1,7 @@
+# Without this the build context is the whole workspace including `target/`,
+# which on a sibling project was 11 GB before the first instruction ran.
+target/
+.git/
+.env
+*.md
+packaging/

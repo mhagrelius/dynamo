@@ -1,0 +1,3 @@
+target/
+# The refresh token and the database password live here. Never committed.
+.env

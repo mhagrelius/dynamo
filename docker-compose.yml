@@ -1,0 +1,95 @@
+# dynamo, for Synology Container Manager.
+#
+# Container Manager → Project → Create, point it at the folder holding this
+# file and the `.env` beside it. See README.md for the whole path.
+#
+# **Do not type this into Container Manager's compose editor.** It carries the
+# previous line's indentation onto the next one and adds what you type to it,
+# so six lines in everything is nested under everything else. Upload the file.
+# The `YAML Configurations` tab on an existing project is read-only.
+#
+# Values come from `.env` in the same folder. Nothing secret is in this file,
+# which is why this one is in git and that one is not.
+
+services:
+  dynamo:
+    image: ${DYNAMO_IMAGE:?set DYNAMO_IMAGE in .env to the tag deploy-server.sh pushed}
+    container_name: dynamo
+    restart: unless-stopped
+
+    # Root, which on this NAS is the setting that works rather than the lazy
+    # one. /volume1 carries Synology's own ACLs, they override POSIX ownership,
+    # and a container uid that is not a DSM user cannot be granted access
+    # through them — a chown on a bind mount reports success and every write
+    # still fails.
+    #
+    # This container has no mount and writes nothing to disk, so like
+    # planner-server it keeps the line as insurance rather than need: adding a
+    # volume later should not resurrect an evening of debugging.
+    user: "0:0"
+
+    # Postgres is its own Container Manager project, so this joins that
+    # project's network rather than going back out through the host. The
+    # database is reached at the container name on its *own* port, 5432, not
+    # the 5433 the NAS publishes it on — so the password never crosses the
+    # tailnet.
+    networks:
+      - postgres_default
+
+    environment:
+      # No defaults on purpose: compose refuses to start without these rather
+      # than inventing them, which is the same posture the binary takes.
+      #
+      # The refresh token is the whole credential. It is not rotated by use —
+      # a successful refresh returns no new one — so it expires on its own
+      # schedule and re-seeding is a manual step. README.md has it.
+      DYNAMO_REFRESH_TOKEN: ${DYNAMO_REFRESH_TOKEN:?paste the Cognito refresh token; see README.md}
+      DYNAMO_DB_HOST: ${DYNAMO_DB_HOST:-postgres}
+      DYNAMO_DB_PORT: ${DYNAMO_DB_PORT:-5432}
+      DYNAMO_DB_NAME: ${DYNAMO_DB_NAME:-dynamo}
+      DYNAMO_DB_USER: ${DYNAMO_DB_USER:-dynamo}
+      DYNAMO_DB_PASSWORD: ${DYNAMO_DB_PASSWORD:?set DYNAMO_DB_PASSWORD in .env}
+      # A minute, because that is the finest resolution the cloud reports.
+      DYNAMO_INTERVAL: ${DYNAMO_INTERVAL:-60}
+      # Requests per second. The first run is some six thousand of them and
+      # there is no published rate limit; this is politeness, not compliance.
+      DYNAMO_RATE: ${DYNAMO_RATE:-4}
+      DYNAMO_STALE: ${DYNAMO_STALE:-900}
+
+    # **No `ports:` block, because nothing listens.** Every other container on
+    # this NAS publishes something; this one only makes outbound connections.
+    # Nothing to forward, nothing on the LAN, no token crossing it in clear.
+
+    # Nothing is written outside the process, so there is no volume and the
+    # filesystem can be taken away entirely. The readings are in Postgres and
+    # the credential arrives through the environment.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      # The image carries no curl and there is no port to call. The binary asks
+      # Postgres: unwell means unreachable, or no successful pass recently, or
+      # a refresh token the pool has stopped accepting.
+      #
+      # `start_period` is two minutes rather than the usual five seconds: the
+      # very first pass is a backfill of thousands of paced requests, and a
+      # container marked unhealthy while it is doing exactly what it should
+      # trains you to ignore the dot.
+      test: ["CMD", "/usr/local/bin/dynamo", "--health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+
+    # No `logging:` block. Naming a driver here makes Container Manager's Log
+    # tab show nothing at all, and that tab is unreliable enough already —
+    # when a container will not start, go to `sudo docker logs` over SSH
+    # rather than believing a blank panel.
+
+networks:
+  # Created by the `postgres` project, not by this one. Declaring it external
+  # means compose joins the existing network rather than making a second one
+  # with a similar name and no database on it.
+  postgres_default:
+    external: true

@@ -1,0 +1,58 @@
+[package]
+name = "dynamo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Three energy monitors, read out of a vendor cloud that forgets, into a database that does not"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "dynamo"
+path = "src/main.rs"
+
+[lib]
+name = "dynamo"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Instants are the whole subject here, and they cross three boundaries that all
+# spell one differently: the API takes and returns RFC 3339 in UTC, Postgres
+# holds `timestamptz`, and the planner does arithmetic on windows. One type
+# through all three is the only way the boundaries cannot disagree.
+chrono = { version = "0.4", default-features = false, features = [
+    "std",
+    "clock",
+    "serde",
+] }
+
+# Postgres, for the same reason planner-server takes it: the readings table is
+# an upsert keyed on four columns and `ON CONFLICT DO UPDATE` is that in one
+# atomic statement. `postgres` rather than `tokio-postgres` — this is one
+# scheduled loop against one database, so a thread and a blocking call are the
+# right shape and an async runtime would be ceremony.
+#
+# `with-chrono-0_4` maps `timestamptz` to the type above rather than
+# marshalling instants through strings, which would be a second place for the
+# two sides to disagree about what a moment is.
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+
+# **The one dependency that parts from every sibling server, so: this service is
+# a client, not a server.** brain-server, planner-server and armory-server all
+# say "no HTTP crate" and mean it — they speak plain HTTP to the tailnet, open
+# no outbound connection, and carry no TLS stack at all. Dynamo is the mirror
+# image. It listens on nothing and its entire job is outbound HTTPS to AWS
+# Cognito and api.emporiaenergy.com, both of which are public hosts with real
+# certificates. Hand-rolling a TLS client is not a hundred lines of testable
+# parsing; it is the one thing in this stack nobody should hand-roll.
+#
+# `ureq` rather than `reqwest`: blocking, no tokio, and rustls rather than
+# OpenSSL — which keeps the runtime image at debian-slim plus ca-certificates
+# and nothing else, the same shape as armory's. `reqwest` would drag an async
+# runtime in behind it for a program that makes one request at a time on
+# purpose.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+[dev-dependencies]
