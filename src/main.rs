@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 
 use dynamo::config::Config;
 use dynamo::emporia::{self, Account};
@@ -95,7 +95,11 @@ fn health() -> ExitCode {
 /// them". A non-zero exit is reserved for the cases where nothing was asked at
 /// all — no credentials, no database.
 fn agent(args: &[String]) -> ExitCode {
-    let request = match dynamo::agent::parse(args, Utc::now()) {
+    // The machine's own timezone, because a day means the user's day. Inside
+    // the container this is UTC and nothing asks it for a day anyway; on a
+    // laptop it is the zone the house is in.
+    let zone = *Local::now().offset();
+    let request = match dynamo::agent::parse(args, Utc::now(), zone) {
         Ok(r) => r,
         Err(dynamo::agent::Refusal(why)) => {
             println!(
@@ -119,7 +123,7 @@ fn agent(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match dynamo::answer::answer(&mut client, &request) {
+    match dynamo::answer::answer(&mut client, &request, zone) {
         Ok(v) => {
             println!("{v}");
             ExitCode::SUCCESS

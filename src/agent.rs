@@ -21,7 +21,7 @@
 //! rather than for GOption's sake. Arguments are positional words and
 //! `key=value` pairs.
 
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, TimeZone, Utc};
 use serde_json::{json, Value};
 
 /// How many rows any verb will return before it starts saying so.
@@ -99,7 +99,7 @@ pub struct Refusal(pub String);
 ///
 /// `now` is passed in rather than read, so every case below is testable against
 /// a fixed clock — "yesterday" is otherwise a different answer every day.
-pub fn parse(args: &[String], now: DateTime<Utc>) -> Result<Request, Refusal> {
+pub fn parse(args: &[String], now: DateTime<Utc>, zone: FixedOffset) -> Result<Request, Refusal> {
     let words: Vec<&str> = args
         .iter()
         .map(String::as_str)
@@ -138,7 +138,7 @@ pub fn parse(args: &[String], now: DateTime<Utc>) -> Result<Request, Refusal> {
         "channels" | "circuits" => Ok(Request::Channels),
         "now" | "current" | "live" => Ok(Request::Now),
         "usage" | "energy" => {
-            let span = span_of(positional.first().copied().unwrap_or("today"), now)?;
+            let span = span_of(positional.first().copied().unwrap_or("today"), now, zone)?;
             let kind = match pairs("kind") {
                 Some(k) => Kind::parse(&k).ok_or_else(|| {
                     Refusal(format!(
@@ -157,7 +157,7 @@ pub fn parse(args: &[String], now: DateTime<Utc>) -> Result<Request, Refusal> {
                         .into(),
                 ));
             };
-            let span = span_of(positional.get(1).copied().unwrap_or("today"), now)?;
+            let span = span_of(positional.get(1).copied().unwrap_or("today"), now, zone)?;
             let scale = match pairs("scale") {
                 Some(s) => scale_of(&s)?,
                 // An hour a point keeps a day inside `MAX_ROWS`, where minutes
@@ -194,13 +194,22 @@ fn scale_of(word: &str) -> Result<crate::scale::Scale, Refusal> {
 /// "Yesterday" ending at this time yesterday would put half of this morning in
 /// it, which is not what anybody means and is exactly the sort of wrong answer
 /// that reads as right.
-fn span_of(word: &str, now: DateTime<Utc>) -> Result<Span, Refusal> {
-    let midnight = |d: DateTime<Utc>| {
-        Utc.with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0)
+///
+/// **And they are boundaries in the user's own *timezone*.** A first version
+/// took midnight in UTC, which for anybody east or west of Greenwich is not
+/// midnight: on this machine, in EDT, `today` began at eight o'clock the
+/// previous evening and every daily figure quietly included four hours of the
+/// day before. The offset is a parameter rather than read from the machine so
+/// that these cases are testable somewhere other than one timezone.
+fn span_of(word: &str, now: DateTime<Utc>, zone: FixedOffset) -> Result<Span, Refusal> {
+    let local = now.with_timezone(&zone);
+    let midnight = |d: DateTime<FixedOffset>| {
+        zone.with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0)
             .single()
-            .unwrap_or(d)
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or(now)
     };
-    let today = midnight(now);
+    let today = midnight(local);
     Ok(match word {
         "today" => Span {
             from: today,
@@ -290,11 +299,25 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// EDT, the timezone this house is in, stated rather than inherited from
+    /// whatever machine runs the suite.
+    fn edt() -> FixedOffset {
+        FixedOffset::west_opt(4 * 3600).unwrap()
+    }
+
+    /// Greenwich, for the cases that are about the words rather than the clock.
+    fn utc() -> FixedOffset {
+        FixedOffset::east_opt(0).unwrap()
+    }
+
     #[test]
     fn the_fixed_prefix_is_tolerated_but_not_required() {
-        assert_eq!(parse(&args("channels"), clock()), Ok(Request::Channels));
         assert_eq!(
-            parse(&args("agent channels"), clock()),
+            parse(&args("channels"), clock(), utc()),
+            Ok(Request::Channels)
+        );
+        assert_eq!(
+            parse(&args("agent channels"), clock(), utc()),
             Ok(Request::Channels)
         );
     }
@@ -303,7 +326,8 @@ mod tests {
     fn yesterday_is_a_whole_day_and_stops_at_midnight() {
         // Not "24 hours ago until now", which would fold half of this morning
         // into yesterday and give a confidently wrong number.
-        let Ok(Request::Usage { span, .. }) = parse(&args("usage yesterday"), clock()) else {
+        let Ok(Request::Usage { span, .. }) = parse(&args("usage yesterday"), clock(), utc())
+        else {
             panic!("usage should parse");
         };
         assert_eq!(span.from.to_rfc3339(), "2026-08-16T00:00:00+00:00");
@@ -312,7 +336,7 @@ mod tests {
 
     #[test]
     fn today_runs_to_the_current_moment_rather_than_to_midnight_tonight() {
-        let Ok(Request::Usage { span, .. }) = parse(&args("usage today"), clock()) else {
+        let Ok(Request::Usage { span, .. }) = parse(&args("usage today"), clock(), utc()) else {
             panic!("usage should parse");
         };
         assert_eq!(span.from.to_rfc3339(), "2026-08-17T00:00:00+00:00");
@@ -321,7 +345,7 @@ mod tests {
 
     #[test]
     fn usage_counts_each_circuit_once_by_default() {
-        let Ok(Request::Usage { kind, .. }) = parse(&args("usage today"), clock()) else {
+        let Ok(Request::Usage { kind, .. }) = parse(&args("usage today"), clock(), utc()) else {
             panic!("usage should parse");
         };
         // The default that stops a 240 V appliance being counted twice.
@@ -329,8 +353,45 @@ mod tests {
     }
 
     #[test]
+    fn a_day_begins_at_local_midnight_and_not_at_utc_midnight() {
+        // The bug this exists for. In EDT, UTC midnight is eight o'clock the
+        // previous evening, so `today` silently carried four hours of
+        // yesterday and every daily figure was wrong by however much the house
+        // drew overnight. Nothing failed; the numbers were just not the ones
+        // anybody asked for.
+        let Ok(Request::Usage { span, .. }) = parse(&args("usage today"), clock(), edt()) else {
+            panic!("usage should parse");
+        };
+        // 2026-08-17T19:30Z is 15:30 EDT, so today began at 04:00Z.
+        assert_eq!(span.from.to_rfc3339(), "2026-08-17T04:00:00+00:00");
+    }
+
+    #[test]
+    fn yesterday_is_a_local_day_end_to_end() {
+        let Ok(Request::Usage { span, .. }) = parse(&args("usage yesterday"), clock(), edt())
+        else {
+            panic!("usage should parse");
+        };
+        assert_eq!(span.from.to_rfc3339(), "2026-08-16T04:00:00+00:00");
+        assert_eq!(span.to.to_rfc3339(), "2026-08-17T04:00:00+00:00");
+        // Exactly one day, not 24 hours that happen to look like one.
+        assert_eq!((span.to - span.from).num_hours(), 24);
+    }
+
+    #[test]
+    fn a_zone_east_of_greenwich_works_too() {
+        // The other direction, because an off-by-one in the sign is easy and
+        // invisible from one timezone.
+        let berlin = FixedOffset::east_opt(2 * 3600).unwrap();
+        let Ok(Request::Usage { span, .. }) = parse(&args("usage today"), clock(), berlin) else {
+            panic!("usage should parse");
+        };
+        assert_eq!(span.from.to_rfc3339(), "2026-08-16T22:00:00+00:00");
+    }
+
+    #[test]
     fn a_period_is_optional_and_defaults_to_today() {
-        let Ok(Request::Usage { span, .. }) = parse(&args("usage"), clock()) else {
+        let Ok(Request::Usage { span, .. }) = parse(&args("usage"), clock(), utc()) else {
             panic!("usage should parse");
         };
         assert_eq!(span.named, "today");
@@ -338,7 +399,8 @@ mod tests {
 
     #[test]
     fn series_defaults_to_hourly_so_a_day_fits_in_one_answer() {
-        let Ok(Request::Series { scale, query, .. }) = parse(&args("series Dryer today"), clock())
+        let Ok(Request::Series { scale, query, .. }) =
+            parse(&args("series Dryer today"), clock(), utc())
         else {
             panic!("series should parse");
         };
@@ -348,7 +410,7 @@ mod tests {
 
     #[test]
     fn a_flag_is_refused_with_what_to_write_instead() {
-        let Err(Refusal(why)) = parse(&args("usage --period yesterday"), clock()) else {
+        let Err(Refusal(why)) = parse(&args("usage --period yesterday"), clock(), utc()) else {
             panic!("a flag should be refused");
         };
         assert!(why.contains("key=value"), "{why}");
@@ -356,7 +418,7 @@ mod tests {
 
     #[test]
     fn an_unknown_verb_names_describe_rather_than_guessing() {
-        let Err(Refusal(why)) = parse(&args("obliterate"), clock()) else {
+        let Err(Refusal(why)) = parse(&args("obliterate"), clock(), utc()) else {
             panic!("should refuse");
         };
         assert!(why.contains("describe"), "{why}");
@@ -364,7 +426,7 @@ mod tests {
 
     #[test]
     fn an_unknown_period_lists_the_ones_that_work() {
-        let Err(Refusal(why)) = parse(&args("usage since-tuesday"), clock()) else {
+        let Err(Refusal(why)) = parse(&args("usage since-tuesday"), clock(), utc()) else {
             panic!("should refuse");
         };
         assert!(why.contains("yesterday"), "{why}");
@@ -372,7 +434,7 @@ mod tests {
 
     #[test]
     fn series_without_a_circuit_says_how_to_find_one() {
-        let Err(Refusal(why)) = parse(&args("series"), clock()) else {
+        let Err(Refusal(why)) = parse(&args("series"), clock(), utc()) else {
             panic!("should refuse");
         };
         assert!(why.contains("channels"), "{why}");

@@ -5,7 +5,7 @@
 //! clock and no database; this asks it. Every query here is a `SELECT`, and the
 //! role the CLI connects as has no other grant.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use postgres::Client;
 use serde_json::{json, Value};
 
@@ -130,13 +130,24 @@ fn scale_for(span: &Span) -> crate::scale::Scale {
     Scale::Day
 }
 
-pub fn answer(c: &mut Client, request: &Request) -> Result<Value, String> {
+/// Render an instant in the caller's own timezone.
+///
+/// **Every timestamp that leaves here is local, not UTC.** A model handed
+/// `2026-08-17T22:44:00+00:00` will say "at 22:44", which is four hours wrong
+/// for the person reading it — and wrong in a way that looks like a fact rather
+/// than a units mistake. The offset is on the string, so anything that wants
+/// UTC can still recover it.
+fn at(t: DateTime<Utc>, zone: FixedOffset) -> String {
+    t.with_timezone(&zone).to_rfc3339()
+}
+
+pub fn answer(c: &mut Client, request: &Request, zone: FixedOffset) -> Result<Value, String> {
     match request {
         Request::Describe => Ok(crate::agent::describe()),
         Request::Channels => channels(c),
-        Request::Now => now(c),
-        Request::Usage { span, kind } => usage(c, span, *kind),
-        Request::Series { query, span, scale } => series(c, query, span, *scale),
+        Request::Now => now(c, zone),
+        Request::Usage { span, kind } => usage(c, span, *kind, zone),
+        Request::Series { query, span, scale } => series(c, query, span, *scale, zone),
     }
 }
 
@@ -168,7 +179,7 @@ fn channels(c: &mut Client) -> Result<Value, String> {
     Ok(json!({"ok": true, "count": list.len(), "circuits": list}))
 }
 
-fn now(c: &mut Client) -> Result<Value, String> {
+fn now(c: &mut Client, zone: FixedOffset) -> Result<Value, String> {
     // The newest minute each circuit has. `DISTINCT ON` rather than a window
     // function because it is the one Postgres does with the index this table
     // already has.
@@ -203,14 +214,14 @@ fn now(c: &mut Client) -> Result<Value, String> {
     let latest = list.iter().map(|(_, _, t)| *t).max();
     let circuits: Vec<Value> = list
         .iter()
-        .map(|(label, watts, at)| {
-            json!({"circuit": label, "watts": watts.round(), "at": at.to_rfc3339()})
+        .map(|(label, watts, moment)| {
+            json!({"circuit": label, "watts": watts.round(), "at": at(*moment, zone)})
         })
         .collect();
     Ok(json!({
         "ok": true,
         "unit": "W",
-        "as_of": latest.map(|t| t.to_rfc3339()),
+        "as_of": latest.map(|t| at(t, zone)),
         // Said out loud because it is the difference between "the house is
         // idle" and "the collector stopped an hour ago", which look identical
         // in a list of small numbers.
@@ -221,7 +232,7 @@ fn now(c: &mut Client) -> Result<Value, String> {
     }))
 }
 
-fn usage(c: &mut Client, span: &Span, kind: Kind) -> Result<Value, String> {
+fn usage(c: &mut Client, span: &Span, kind: Kind, zone: FixedOffset) -> Result<Value, String> {
     let scale = scale_for(span);
     let rows = c
         .query(
@@ -254,8 +265,8 @@ fn usage(c: &mut Client, span: &Span, kind: Kind) -> Result<Value, String> {
     Ok(json!({
         "ok": true,
         "period": span.named,
-        "from": span.from.to_rfc3339(),
-        "to": span.to.to_rfc3339(),
+        "from": at(span.from, zone),
+        "to": at(span.to, zone),
         "resolution": scale.api_name(),
         "kind": match kind {
             Kind::Main => "main", Kind::Branch => "branch",
@@ -275,6 +286,7 @@ fn series(
     query: &str,
     span: &Span,
     scale: crate::scale::Scale,
+    zone: FixedOffset,
 ) -> Result<Value, String> {
     // Resolve the circuit first, and say so when it is ambiguous rather than
     // picking one. The same posture as Planner's `ambiguous`: two circuits here
@@ -350,7 +362,7 @@ fn series(
         .map(|r| {
             let kwh: f64 = r.get(1);
             json!({
-                "at": r.get::<_, DateTime<Utc>>(0).to_rfc3339(),
+                "at": at(r.get::<_, DateTime<Utc>>(0), zone),
                 "kwh": (kwh * 1000.0).round() / 1000.0,
                 "watts": (kwh * per_hour).round(),
             })
