@@ -8,6 +8,8 @@
 //! Postgres. Everything worth arguing about is on the pure side, where it has
 //! tests instead of a comment saying it was thought about.
 
+pub mod agent;
+pub mod answer;
 pub mod cognito;
 pub mod config;
 pub mod emporia;

@@ -35,9 +35,13 @@ pub fn migrate(c: &mut Client) -> Result<(), String> {
             name         TEXT,
             kind         TEXT   NOT NULL,
             multiplier   DOUBLE PRECISION,
+            -- Which merged channel a branch leg belongs to. What makes "every
+            -- circuit, counted once" a query rather than a heuristic.
+            merged_into  TEXT,
             seen_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (device_gid, channel_num)
         );
+        ALTER TABLE channel ADD COLUMN IF NOT EXISTS merged_into TEXT;
 
         -- One reading is a channel, a resolution and an instant. The key is
         -- over all four so re-fetching an overlapping window is free, which is
@@ -85,13 +89,15 @@ pub fn migrate(c: &mut Client) -> Result<(), String> {
 pub fn save_channels(c: &mut Client, channels: &[NamedChannel]) -> Result<(), String> {
     for ch in channels {
         c.execute(
-            "INSERT INTO channel (device_gid, channel_num, device_name, name, kind, multiplier, seen_at)
-             VALUES ($1,$2,$3,$4,$5,$6, now())
+            "INSERT INTO channel
+               (device_gid, channel_num, device_name, name, kind, multiplier, merged_into, seen_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7, now())
              ON CONFLICT (device_gid, channel_num) DO UPDATE SET
                device_name = EXCLUDED.device_name,
                name        = EXCLUDED.name,
                kind        = EXCLUDED.kind,
                multiplier  = EXCLUDED.multiplier,
+               merged_into = EXCLUDED.merged_into,
                seen_at     = now()",
             &[
                 &ch.device_gid,
@@ -100,6 +106,7 @@ pub fn save_channels(c: &mut Client, channels: &[NamedChannel]) -> Result<(), St
                 &ch.name,
                 &ch.kind.as_str(),
                 &ch.multiplier,
+                &ch.merged_into,
             ],
         )
         .map_err(|e| format!("cannot record channel {}: {e}", ch.channel_num))?;

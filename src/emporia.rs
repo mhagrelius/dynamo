@@ -144,6 +144,15 @@ pub struct ApiChannel {
     pub multiplier: Option<f64>,
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
+    /// Which merged pseudo-channel this leg was folded into, if any.
+    ///
+    /// This is what makes "every circuit, counted once" answerable without a
+    /// heuristic: a merged channel plus the branch legs that belong to no merge
+    /// is exactly the set of things a person would call a circuit. Guessing it
+    /// from matching names would break on the two channels here already named
+    /// the same thing on purpose.
+    #[serde(rename = "mergedChannelId", default)]
+    pub merged_into: Option<String>,
 }
 
 /// One flattened channel, with the name a person gave it.
@@ -155,6 +164,9 @@ pub struct NamedChannel {
     pub name: Option<String>,
     pub kind: ChannelKind,
     pub multiplier: Option<f64>,
+    /// The merged channel this leg belongs to, if any. `None` on a merged
+    /// channel itself and on a branch that stands alone.
+    pub merged_into: Option<String>,
 }
 
 /// Every channel in the account, nested devices flattened in.
@@ -191,6 +203,7 @@ fn walk(d: &Device, inherited_name: Option<String>, out: &mut Vec<NamedChannel>)
             name: c.name.clone(),
             kind: ChannelKind::of(&c.channel_num),
             multiplier: c.multiplier,
+            merged_into: c.merged_into.clone(),
         });
     }
     for nested in &d.devices {

@@ -13,10 +13,13 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("--health") => health(),
         Some("--once") => run(true),
+        // The read-only JSON interface Familiar drives. Same shape as
+        // `planner agent` and `magpie agent`.
+        Some("agent") => agent(&args[1..]),
         None => run(false),
         Some(other) => {
             eprintln!("dynamo: unknown argument {other}");
-            eprintln!("usage: dynamo [--once | --health]");
+            eprintln!("usage: dynamo [--once | --health | agent <verb>]");
             ExitCode::FAILURE
         }
     }
@@ -79,6 +82,54 @@ fn health() -> ExitCode {
                 println!("ok: last success {age}s ago{credential}");
                 ExitCode::SUCCESS
             }
+        }
+    }
+}
+
+/// `dynamo agent <verb>` — read, print JSON, exit.
+///
+/// **Every failure is JSON too, and the exit code is still 0 for a refusal.**
+/// Familiar reads stdout and hands it to a model; a non-zero exit with a
+/// message on stderr becomes "the tool failed", which is the wrong thing to
+/// tell it when the truth is "that circuit does not exist, here is how to list
+/// them". A non-zero exit is reserved for the cases where nothing was asked at
+/// all — no credentials, no database.
+fn agent(args: &[String]) -> ExitCode {
+    let request = match dynamo::agent::parse(args, Utc::now()) {
+        Ok(r) => r,
+        Err(dynamo::agent::Refusal(why)) => {
+            println!(
+                "{}",
+                serde_json::json!({"ok": false, "error": "bad-request", "message": why})
+            );
+            return ExitCode::SUCCESS;
+        }
+    };
+    let db = match Config::reader_from_env_or_file() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("dynamo: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut client = match store::connect(&db) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("dynamo: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match dynamo::answer::answer(&mut client, &request) {
+        Ok(v) => {
+            println!("{v}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!(
+                "{}",
+                serde_json::json!({"ok": false, "error": "query-failed", "message": e})
+            );
+            ExitCode::SUCCESS
         }
     }
 }
