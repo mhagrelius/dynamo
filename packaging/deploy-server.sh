@@ -140,7 +140,9 @@ fi
 
 tables="$(podman exec "$PG" psql -U dynamo -d dynamo -tAc \
     "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname='public'")"
-if [ "$tables" = "channel,heartbeat,reading" ]; then
+# Spelled out rather than counted, so adding a table is a deliberate edit here
+# and a dropped one is a failure rather than a smaller number nobody reads.
+if [ "$tables" = "channel,heartbeat,probe,reading" ]; then
     echo "    creates its schema on a fresh database"
 else
     echo "    the schema is not what it should be, it is: $tables" >&2
